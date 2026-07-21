@@ -375,7 +375,12 @@ impl<'a> TerminalView<'a> {
             BindingAction::Paste => {
                 if let Some(data) = clipboard.read(ClipboardKind::Standard) {
                     let input: Vec<u8> = data.bytes().collect();
-                    return Some(Command::Write(input));
+                    let bracketed = last_content
+                        .terminal_mode
+                        .contains(TermMode::BRACKETED_PASTE);
+                    return Some(Command::Write(wrap_bracketed_paste(
+                        input, bracketed,
+                    )));
                 }
             },
             BindingAction::Copy => {
@@ -834,9 +839,57 @@ impl BackgroundRect {
     }
 }
 
+// Wrap pasted text in bracketed paste when the target application has enabled the mode. The markers
+// `\x1b[200~` / `\x1b[201~` make the application (readline, TUIs) receive the paste as a single BLOCK, so
+// inner newlines are not interpreted as Enter (a multi-line paste is not submitted line by line). When
+// the mode is off, the bytes are written unchanged (historical behavior).
+//
+// ESC (0x1b) and Ctrl-C (0x03) are stripped from the pasted text first, mirroring Alacritty: otherwise a
+// clipboard that itself contains `\x1b[201~` would close the bracketed paste early (the rest would be
+// interpreted as keystrokes), and some shells terminate bracketed paste on 0x03.
+fn wrap_bracketed_paste(input: Vec<u8>, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return input;
+    }
+    let filtered: Vec<u8> = input
+        .into_iter()
+        .filter(|&b| b != 0x1b && b != 0x03)
+        .collect();
+    let mut out = Vec::with_capacity(filtered.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(&filtered);
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod wrap_bracketed_paste_tests {
+        use super::*;
+
+        #[test]
+        fn wraps_only_when_active() {
+            let input = b"line 1\nline 2".to_vec();
+            assert_eq!(wrap_bracketed_paste(input.clone(), false), input);
+            let wrapped = wrap_bracketed_paste(input.clone(), true);
+            assert!(wrapped.starts_with(b"\x1b[200~"));
+            assert!(wrapped.ends_with(b"\x1b[201~"));
+            assert_eq!(&wrapped[6..wrapped.len() - 6], input.as_slice());
+        }
+
+        #[test]
+        fn filters_escape_and_ctrl_c() {
+            // A clipboard containing `\x1b[201~` must not be able to close the bracketed paste early.
+            let wrapped =
+                wrap_bracketed_paste(b"a\x1b[201~b\x03c".to_vec(), true);
+            let body = &wrapped[6..wrapped.len() - 6];
+            assert_eq!(body, b"a[201~bc");
+            assert!(!body.contains(&0x1b));
+            assert!(!body.contains(&0x03));
+        }
+    }
 
     mod handle_left_button_pressed_tests {
         use super::*;
