@@ -1,28 +1,30 @@
 use crate::actions::Action;
 use crate::settings::BackendSettings;
-use alacritty_terminal::event::{
-    Event, EventListener, Notify, OnResize, WindowSize,
-};
-use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
-use alacritty_terminal::term::{
-    self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
-};
-use alacritty_terminal::{tty, Grid};
+use corcovado::channel::Sender;
 use iced::keyboard::Modifiers;
 use iced_core::Size;
+use rio_vt::ansi::CursorShape;
+use rio_vt::config::colors::{AnsiColor, ColorRgb, NamedColor};
+use rio_vt::crosswords::grid::{Dimensions, Grid, Scroll};
+use rio_vt::crosswords::pos::{Column, Direction, Line, Pos, Side};
+use rio_vt::crosswords::search::{Match, RegexIter, RegexSearch};
+use rio_vt::crosswords::square::{ContentTag, Square};
+use rio_vt::crosswords::{Crosswords, Mode as TermMode};
+use rio_vt::event::sync::FairMutex;
+use rio_vt::event::{EventListener, Msg, RioEvent, WindowId};
+use rio_vt::performer::Machine;
+use rio_vt::selection::{Selection, SelectionRange, SelectionType};
 use std::borrow::Cow;
 use std::cmp::min;
 use std::io::Result;
-use std::ops::{Index, RangeInclusive};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
+use teletypewriter::{create_pty_with_spawn, WinsizeBuilder};
 use tokio::sync::mpsc;
 
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
+
+const SCROLLBACK_HISTORY: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub enum Command {
@@ -31,9 +33,9 @@ pub enum Command {
     Resize(Option<Size<f32>>, Option<Size<f32>>),
     SelectStart(SelectionType, (f32, f32)),
     SelectUpdate((f32, f32)),
-    ProcessLink(LinkAction, Point),
-    MouseReport(MouseButton, Modifiers, Point, bool),
-    ProcessAlacrittyEvent(Event),
+    ProcessLink(LinkAction, Pos),
+    MouseReport(MouseButton, Modifiers, Pos, bool),
+    ProcessRioEvent(RioEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -120,21 +122,10 @@ impl Dimensions for TerminalSize {
     }
 }
 
-impl From<TerminalSize> for WindowSize {
-    fn from(size: TerminalSize) -> Self {
-        Self {
-            num_lines: size.num_lines,
-            num_cols: size.num_cols,
-            cell_width: size.cell_width,
-            cell_height: size.cell_height,
-        }
-    }
-}
-
 pub struct Backend {
-    term: Arc<FairMutex<Term<EventProxy>>>,
+    term: Arc<FairMutex<Crosswords<EventProxy>>>,
     size: TerminalSize,
-    notifier: Notifier,
+    channel: Sender<Msg>,
     last_content: RenderableContent,
     pub(crate) url_regex: RegexSearch,
 }
@@ -142,48 +133,70 @@ pub struct Backend {
 impl Backend {
     pub fn new(
         id: u64,
-        pty_event_proxy_sender: mpsc::Sender<Event>,
+        pty_event_proxy_sender: mpsc::Sender<RioEvent>,
         settings: BackendSettings,
     ) -> Result<Self> {
-        let pty_config = tty::Options {
-            shell: Some(tty::Shell::new(settings.program, settings.args)),
-            working_directory: settings.working_directory,
-            env: settings.env,
-            ..tty::Options::default()
-        };
-
-        let config = term::Config::default();
         let terminal_size = TerminalSize::default();
-        let pty = tty::new(&pty_config, terminal_size.into(), id)?;
-
         let event_proxy = EventProxy(pty_event_proxy_sender);
 
-        let mut term = Term::new(config, &terminal_size, event_proxy.clone());
+        let mut term = Crosswords::new(
+            terminal_size,
+            CursorShape::Block,
+            event_proxy.clone(),
+            WindowId::from(id),
+            0,
+            SCROLLBACK_HISTORY,
+        );
 
-        let cursor = term.grid_mut().cursor_cell().clone();
+        let cursor = *term.grid.cursor_cell();
 
         let initial_content = RenderableContent {
-            grid: term.grid().clone(),
+            grid: term.grid.clone(),
             selectable_range: None,
-            terminal_mode: *term.mode(),
+            terminal_mode: term.mode(),
             terminal_size,
-            cursor: cursor.clone(),
+            cursor,
             hovered_hyperlink: None,
         };
 
         let term = Arc::new(FairMutex::new(term));
 
-        let pty_event_loop =
-            EventLoop::new(term.clone(), event_proxy, pty, false, false)?;
+        // rio-vt's teletypewriter spawns the PTY directly.
+        // TODO(rio-vt): create_pty_with_spawn takes no env map, so
+        // BackendSettings.env is not applied. The alacritty backend passed
+        // env through tty::Options. Wire this once teletypewriter grows an
+        // env parameter (or set it on the spawned child another way).
+        let working_directory = settings
+            .working_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
 
-        let notifier = Notifier(pty_event_loop.channel());
+        let pty = create_pty_with_spawn(
+            &settings.program,
+            settings.args.clone(),
+            &working_directory,
+            terminal_size.num_cols,
+            terminal_size.num_lines,
+            0,
+            0,
+        )?;
 
-        let _ = pty_event_loop.spawn();
+        let machine = Machine::new(
+            Arc::clone(&term),
+            pty,
+            event_proxy,
+            WindowId::from(id),
+            0,
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        let channel = machine.channel();
+        let _io_thread = machine.spawn();
 
         Ok(Self {
             term: term.clone(),
             size: terminal_size,
-            notifier,
+            channel,
             last_content: initial_content,
             url_regex: RegexSearch::new(URL_REGEX).expect("invalid url regexp"),
         })
@@ -194,16 +207,22 @@ impl Backend {
         let term = self.term.clone();
         let mut term = term.lock();
         match cmd {
-            Command::ProcessAlacrittyEvent(event) => {
+            Command::ProcessRioEvent(event) => {
                 match event {
-                    Event::Exit => {
+                    RioEvent::Exit
+                    | RioEvent::Quit
+                    | RioEvent::CloseTerminal(_) => {
                         action = Action::Shutdown;
                     },
-                    Event::Title(title) => {
+                    RioEvent::Title(title)
+                    | RioEvent::TitleWithSubtitle(title, _) => {
                         action = Action::ChangeTitle(title);
                     },
-                    Event::PtyWrite(pty) => {
-                        self.notifier.notify(pty.into_bytes())
+                    RioEvent::ResetTitle => {
+                        action = Action::ChangeTitle(String::new());
+                    },
+                    RioEvent::PtyWrite(_, text) => {
+                        self.write(text.into_bytes());
                     },
                     _ => {},
                 };
@@ -237,9 +256,9 @@ impl Backend {
 
     fn process_link_action(
         &mut self,
-        terminal: &Term<EventProxy>,
+        terminal: &Crosswords<EventProxy>,
         link_action: LinkAction,
-        point: Point,
+        point: Pos,
     ) {
         match link_action {
             LinkAction::Hover => {
@@ -263,10 +282,10 @@ impl Backend {
             let start = range.start();
             let end = range.end();
 
-            let mut url = String::from(self.last_content.grid.index(*start).c);
+            let mut url = String::from(self.last_content.grid[*start].c());
             for indexed in self.last_content.grid.iter_from(*start) {
-                url.push(indexed.c);
-                if indexed.point == *end {
+                url.push(indexed.square.c());
+                if indexed.pos == *end {
                     break;
                 }
             }
@@ -281,7 +300,7 @@ impl Backend {
         &self,
         button: MouseButton,
         modifiers: Modifiers,
-        point: Point,
+        point: Pos,
         pressed: bool,
     ) {
         let mut mods = 0;
@@ -313,25 +332,25 @@ impl Backend {
         }
     }
 
-    fn sgr_mouse_report(&self, point: Point, button: u8, pressed: bool) {
+    fn sgr_mouse_report(&self, point: Pos, button: u8, pressed: bool) {
         let c = if pressed { 'M' } else { 'm' };
 
         let msg = format!(
             "\x1b[<{};{};{}{}",
             button,
-            point.column + 1,
-            point.line + 1,
+            point.col + 1,
+            point.row + 1,
             c
         );
 
-        self.notifier.notify(msg.as_bytes().to_vec());
+        self.write(msg.into_bytes());
     }
 
-    fn normal_mouse_report(&self, point: Point, button: u8, is_utf8: bool) {
-        let Point { line, column } = point;
+    fn normal_mouse_report(&self, point: Pos, button: u8, is_utf8: bool) {
+        let Pos { row: line, col: column } = point;
         let max_point = if is_utf8 { 2015 } else { 223 };
 
-        if line >= max_point || column >= max_point {
+        if line.0 >= max_point || column.0 >= max_point as usize {
             return;
         }
 
@@ -356,12 +375,12 @@ impl Backend {
             msg.push(32 + 1 + line.0 as u8);
         }
 
-        self.notifier.notify(msg);
+        self.write(msg);
     }
 
     fn start_selection(
         &mut self,
-        terminal: &mut Term<EventProxy>,
+        terminal: &mut Crosswords<EventProxy>,
         selection_type: SelectionType,
         x: f32,
         y: f32,
@@ -370,7 +389,7 @@ impl Backend {
             x,
             y,
             &self.size,
-            terminal.grid().display_offset(),
+            terminal.grid.display_offset(),
         );
         terminal.selection = Some(Selection::new(
             selection_type,
@@ -381,11 +400,11 @@ impl Backend {
 
     fn update_selection(
         &mut self,
-        terminal: &mut Term<EventProxy>,
+        terminal: &mut Crosswords<EventProxy>,
         x: f32,
         y: f32,
     ) {
-        let display_offset = terminal.grid().display_offset();
+        let display_offset = terminal.grid.display_offset();
         if let Some(ref mut selection) = terminal.selection {
             let location =
                 Self::selection_point(x, y, &self.size, display_offset);
@@ -398,14 +417,16 @@ impl Backend {
         y: f32,
         terminal_size: &TerminalSize,
         display_offset: usize,
-    ) -> Point {
+    ) -> Pos {
         let col = (x as usize) / (terminal_size.cell_width as usize);
         let col = min(Column(col), Column(terminal_size.num_cols as usize - 1));
 
         let line = (y as usize) / (terminal_size.cell_height as usize);
         let line = min(line, terminal_size.num_lines as usize - 1);
 
-        viewport_to_point(display_offset, Point::new(line, col))
+        // viewport_to_point: translate a viewport line into a grid line by
+        // subtracting the display offset (scrollback amount).
+        Pos::new(Line(line as i32) - display_offset, col)
     }
 
     fn selection_side(&self, x: f32) -> Side {
@@ -421,7 +442,7 @@ impl Backend {
 
     fn resize(
         &mut self,
-        terminal: &mut Term<EventProxy>,
+        terminal: &mut Crosswords<EventProxy>,
         layout_size: Option<Size<f32>>,
         font_measure: Option<Size<f32>>,
     ) {
@@ -442,19 +463,25 @@ impl Backend {
         if lines > 0 && cols > 0 {
             self.size.num_lines = lines;
             self.size.num_cols = cols;
-            self.notifier.on_resize(self.size.into());
-            terminal.resize(TermSize::new(
-                self.size.num_cols as usize,
-                self.size.num_lines as usize,
-            ));
+            let _ = self.channel.send(Msg::Resize(WinsizeBuilder {
+                rows: self.size.num_lines,
+                cols: self.size.num_cols,
+                width: self.size.layout_width as u16,
+                height: self.size.layout_height as u16,
+            }));
+            terminal.resize(self.size);
         }
     }
 
     fn write<I: Into<Cow<'static, [u8]>>>(&self, input: I) {
-        self.notifier.notify(input);
+        let _ = self.channel.send(Msg::Input(input.into()));
     }
 
-    fn scroll(&mut self, terminal: &mut Term<EventProxy>, delta_value: i32) {
+    fn scroll(
+        &mut self,
+        terminal: &mut Crosswords<EventProxy>,
+        delta_value: i32,
+    ) {
         if delta_value != 0 {
             let scroll = Scroll::Delta(delta_value);
             if terminal
@@ -470,9 +497,9 @@ impl Backend {
                     content.push(line_cmd);
                 }
 
-                self.notifier.notify(content);
+                self.write(content);
             } else {
-                terminal.grid_mut().scroll_display(scroll);
+                terminal.scroll_display(scroll);
             }
         }
     }
@@ -482,8 +509,8 @@ impl Backend {
         let mut result = String::new();
         if let Some(range) = content.selectable_range {
             for indexed in content.grid.display_iter() {
-                if range.contains(indexed.point) {
-                    result.push(indexed.c);
+                if range.contains(indexed.pos) {
+                    result.push(indexed.square.c());
                 }
             }
         }
@@ -496,17 +523,17 @@ impl Backend {
         self.internal_sync(&mut term);
     }
 
-    fn internal_sync(&mut self, terminal: &mut Term<EventProxy>) {
+    fn internal_sync(&mut self, terminal: &mut Crosswords<EventProxy>) {
         let selectable_range = match &terminal.selection {
             Some(s) => s.to_range(terminal),
             None => None,
         };
 
-        let cursor = terminal.grid_mut().cursor_cell().clone();
-        self.last_content.grid = terminal.grid().clone();
+        let cursor = *terminal.grid.cursor_cell();
+        self.last_content.grid = terminal.grid.clone();
         self.last_content.selectable_range = selectable_range;
-        self.last_content.cursor = cursor.clone();
-        self.last_content.terminal_mode = *terminal.mode();
+        self.last_content.cursor = cursor;
+        self.last_content.terminal_mode = terminal.mode();
         self.last_content.terminal_size = self.size;
     }
 
@@ -518,40 +545,37 @@ impl Backend {
     /// Retrieve the match, if the specified point is inside the content matching the regex.
     fn regex_match_at(
         &self,
-        terminal: &Term<EventProxy>,
-        point: Point,
+        terminal: &Crosswords<EventProxy>,
+        point: Pos,
         regex: &mut RegexSearch,
     ) -> Option<Match> {
-        let x = visible_regex_match_iter(terminal, regex)
-            .find(|rm| rm.contains(&point));
-        x
+        visible_regex_match_iter(terminal, regex).find(|rm| rm.contains(&point))
     }
 }
 
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
 fn visible_regex_match_iter<'a>(
-    term: &'a Term<EventProxy>,
+    term: &'a Crosswords<EventProxy>,
     regex: &'a mut RegexSearch,
 ) -> impl Iterator<Item = Match> + 'a {
-    let viewport_start = Line(-(term.grid().display_offset() as i32));
+    let viewport_start = Line(-(term.grid.display_offset() as i32));
     let viewport_end = viewport_start + term.bottommost_line();
-    let mut start =
-        term.line_search_left(Point::new(viewport_start, Column(0)));
-    let mut end = term.line_search_right(Point::new(viewport_end, Column(0)));
-    start.line = start.line.max(viewport_start - 100);
-    end.line = end.line.min(viewport_end + 100);
+    let mut start = term.line_search_left(Pos::new(viewport_start, Column(0)));
+    let mut end = term.line_search_right(Pos::new(viewport_end, Column(0)));
+    start.row = start.row.max(viewport_start - 100);
+    end.row = end.row.min(viewport_end + 100);
 
     RegexIter::new(start, end, Direction::Right, term, regex)
-        .skip_while(move |rm| rm.end().line < viewport_start)
-        .take_while(move |rm| rm.start().line <= viewport_end)
+        .skip_while(move |rm| rm.end().row < viewport_start)
+        .take_while(move |rm| rm.start().row <= viewport_end)
 }
 
 pub struct RenderableContent {
-    pub grid: Grid<Cell>,
-    pub hovered_hyperlink: Option<RangeInclusive<Point>>,
+    pub grid: Grid<Square>,
+    pub hovered_hyperlink: Option<RangeInclusive<Pos>>,
     pub selectable_range: Option<SelectionRange>,
-    pub cursor: Cell,
+    pub cursor: Square,
     pub terminal_mode: TermMode,
     pub terminal_size: TerminalSize,
 }
@@ -562,24 +586,64 @@ impl Default for RenderableContent {
             grid: Grid::new(0, 0, 0),
             hovered_hyperlink: None,
             selectable_range: None,
-            cursor: Cell::default(),
+            cursor: Square::default(),
             terminal_mode: TermMode::empty(),
             terminal_size: TerminalSize::default(),
         }
     }
 }
 
+/// Resolve a square's foreground/background colors (as `AnsiColor`) from the
+/// per-grid style side-table. rio-vt packs each cell into a `u64`; text cells
+/// index into `style_set`, while bg-only cells encode the background inline.
+pub(crate) fn square_colors(
+    square: Square,
+    styles: &[rio_vt::crosswords::style::Style],
+) -> (AnsiColor, AnsiColor, rio_vt::crosswords::style::StyleFlags) {
+    use rio_vt::crosswords::style::StyleFlags;
+    match square.content_tag() {
+        ContentTag::Codepoint => {
+            let style = styles
+                .get(square.style_id() as usize)
+                .copied()
+                .unwrap_or_default();
+            (style.fg, style.bg, style.flags)
+        },
+        ContentTag::BgPalette => (
+            AnsiColor::Named(NamedColor::Foreground),
+            AnsiColor::Indexed(square.bg_palette_index()),
+            StyleFlags::empty(),
+        ),
+        ContentTag::BgRgb => {
+            let (r, g, b) = square.bg_rgb();
+            (
+                AnsiColor::Named(NamedColor::Foreground),
+                AnsiColor::Spec(ColorRgb { r, g, b }),
+                StyleFlags::empty(),
+            )
+        },
+    }
+}
+
 impl Drop for Backend {
     fn drop(&mut self) {
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        let _ = self.channel.send(Msg::Shutdown);
     }
 }
 
 #[derive(Clone)]
-pub struct EventProxy(mpsc::Sender<Event>);
+pub struct EventProxy(mpsc::Sender<RioEvent>);
 
 impl EventListener for EventProxy {
-    fn send_event(&self, event: Event) {
+    fn event(&self) -> (Option<RioEvent>, bool) {
+        (None, false)
+    }
+
+    fn send_event(&self, event: RioEvent, _id: WindowId) {
+        let _ = self.0.try_send(event);
+    }
+
+    fn send_event_with_high_priority(&self, event: RioEvent, _id: WindowId) {
         let _ = self.0.try_send(event);
     }
 }

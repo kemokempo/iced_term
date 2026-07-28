@@ -1,13 +1,14 @@
 use crate::backend::{
-    Backend, Command, LinkAction, MouseButton, RenderableContent,
+    square_colors, Backend, Command, LinkAction, MouseButton, RenderableContent,
 };
 use crate::bindings::{BindingAction, BindingsLayout, InputKind};
 use crate::terminal::{Event, Terminal};
 use crate::theme::TerminalStyle;
-use alacritty_terminal::index::Point as TerminalGridPoint;
-use alacritty_terminal::selection::SelectionType;
-use alacritty_terminal::term::{cell, TermMode};
-use alacritty_terminal::vte::ansi::{self as ansi, NamedColor};
+use rio_vt::config::colors::{AnsiColor, NamedColor};
+use rio_vt::crosswords::pos::Pos as TerminalGridPoint;
+use rio_vt::crosswords::style::StyleFlags;
+use rio_vt::crosswords::Mode as TermMode;
+use rio_vt::selection::SelectionType;
 use iced::alignment::Vertical;
 use iced::font::{Style as FontStyle, Weight as FontWeight};
 use iced::mouse::{Cursor, ScrollDelta};
@@ -467,15 +468,21 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
             let default_bg = self
                 .term
                 .theme
-                .get_color(ansi::Color::Named(NamedColor::Background));
+                .get_color(AnsiColor::Named(NamedColor::Background));
+
+            // Per-cell colors live in the grid's style side-table.
+            let styles = content.grid.style_set.styles();
 
             let mut last_line: Option<i32> = None;
             let mut bg_batch_rect = BackgroundRect::default();
 
             for indexed in content.grid.display_iter() {
                 // Compute per-cell geometry cheaply
-                let line = indexed.point.line.0;
-                let col = indexed.point.column.0 as f32;
+                let line = indexed.pos.row.0;
+                let col = indexed.pos.col.0 as f32;
+                let square = *indexed.square;
+                let ch = square.c();
+                let (fg_color, bg_color, flags) = square_colors(square, styles);
 
                 // Resolve position point for this cell
                 let x = layout_offset_x + (col * cell_width);
@@ -485,8 +492,8 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 let cell_center_x = x + half_w;
 
                 // Resolve colors for this cell
-                let mut fg = self.term.theme.get_color(indexed.fg);
-                let mut bg = self.term.theme.get_color(indexed.bg);
+                let mut fg = self.term.theme.get_color(fg_color);
+                let mut bg = self.term.theme.get_color(bg_color);
                 // Pre-swap background: the block cursor is painted in the
                 // cell's (pre-swap) fg, so this is the contrasting color
                 // for the glyph under it regardless of INVERSE/selection.
@@ -511,17 +518,13 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 }
 
                 // Handle dim, inverse, and selected text
-                if indexed
-                    .cell
-                    .flags
-                    .intersects(cell::Flags::DIM | cell::Flags::DIM_BOLD)
-                {
+                if flags.intersects(StyleFlags::DIM | StyleFlags::DIM_BOLD) {
                     fg.a *= 0.7;
                 }
-                if indexed.cell.flags.contains(cell::Flags::INVERSE)
+                if flags.contains(StyleFlags::INVERSE)
                     || content
                         .selectable_range
-                        .is_some_and(|r| r.contains(indexed.point))
+                        .is_some_and(|r| r.contains(indexed.pos))
                 {
                     std::mem::swap(&mut fg, &mut bg);
                 }
@@ -562,9 +565,9 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
 
                 // Draw hovered hyperlink underline (rare; keep per-cell for correctness)
                 if content.hovered_hyperlink.as_ref().is_some_and(|range| {
-                    range.contains(&indexed.point)
+                    range.contains(&indexed.pos)
                         && range.contains(&state.mouse_position_on_grid)
-                }) || indexed.cell.flags.contains(cell::Flags::UNDERLINE)
+                }) || flags.contains(StyleFlags::UNDERLINE)
                 {
                     let underline_height = y + cell_size.height;
                     let underline = Path::line(
@@ -580,43 +583,41 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 }
 
                 // Handle cursor rendering
-                if content.grid.cursor.point == indexed.point
+                if content.grid.cursor.pos == indexed.pos
                     && content.terminal_mode.contains(TermMode::SHOW_CURSOR)
                 {
-                    let cursor_color =
-                        self.term.theme.get_color(content.cursor.fg);
+                    let (cursor_fg, _, _) =
+                        square_colors(content.cursor, styles);
+                    let cursor_color = self.term.theme.get_color(cursor_fg);
                     let cursor_rect =
                         Path::rectangle(Point::new(x, y), cell_size);
                     frame.fill(&cursor_rect, cursor_color);
                 }
 
                 // Draw text
-                if indexed.c != ' ' && indexed.c != '\t' {
+                if ch != ' ' && ch != '\t' && ch != '\0' {
                     // The glyph under the block cursor must contrast with
                     // the cursor rect (painted above in the cell's pre-swap
                     // fg). Using the post-swap bg — or gating this on
                     // APP_CURSOR, a keypad mode unrelated to rendering —
                     // made the glyph invisible whenever the cell was
                     // INVERSE or inside a selection.
-                    if content.grid.cursor.point == indexed.point
+                    if content.grid.cursor.pos == indexed.pos
                         && content.terminal_mode.contains(TermMode::SHOW_CURSOR)
                     {
                         fg = cell_bg;
                     }
                     // Resolve font style (bold/italic) from cell flags
                     let mut font = self.term.font.font_type;
-                    if indexed
-                        .cell
-                        .flags
-                        .intersects(cell::Flags::BOLD | cell::Flags::DIM_BOLD)
+                    if flags.intersects(StyleFlags::BOLD | StyleFlags::DIM_BOLD)
                     {
                         font.weight = FontWeight::Bold;
                     }
-                    if indexed.cell.flags.contains(cell::Flags::ITALIC) {
+                    if flags.contains(StyleFlags::ITALIC) {
                         font.style = FontStyle::Italic;
                     }
                     let text = Text {
-                        content: indexed.cell.c.to_string(),
+                        content: ch.to_string(),
                         position: Point::new(cell_center_x, cell_center_y),
                         font,
                         size: iced_core::Pixels(font_size),
@@ -840,7 +841,7 @@ mod tests {
 
     mod handle_left_button_pressed_tests {
         use super::*;
-        use alacritty_terminal::index::{Column, Line};
+        use rio_vt::crosswords::pos::{Column, Line};
 
         #[test]
         fn handles_mouse_mode_with_left_click() {
@@ -866,8 +867,8 @@ mod tests {
                     MouseButton::LeftButton,
                     _modifiers,
                     TerminalGridPoint {
-                        line: Line(0),
-                        column: Column(0),
+                        row: Line(0),
+                        col: Column(0),
                     },
                     true,
                 )
@@ -911,7 +912,7 @@ mod tests {
     }
 
     mod handle_cursor_moved_tests {
-        use alacritty_terminal::index::{Column, Line};
+        use rio_vt::crosswords::pos::{Column, Line};
 
         use super::*;
 
@@ -925,40 +926,40 @@ mod tests {
                     Point { x: 0.0, y: 0.0 },
                     Point { x: 1.0, y: 1.0 },
                     TerminalGridPoint {
-                        line: Line(1),
-                        column: Column(1),
+                        row: Line(1),
+                        col: Column(1),
                     },
                 ),
                 (
                     Point { x: 0.0, y: 0.0 },
                     Point { x: 2.0, y: 2.0 },
                     TerminalGridPoint {
-                        line: Line(2),
-                        column: Column(2),
+                        row: Line(2),
+                        col: Column(2),
                     },
                 ),
                 (
                     Point { x: 0.0, y: 0.0 },
                     Point { x: 30.0, y: 2.0 },
                     TerminalGridPoint {
-                        line: Line(2),
-                        column: Column(30),
+                        row: Line(2),
+                        col: Column(30),
                     },
                 ),
                 (
                     Point { x: 10.0, y: 0.0 },
                     Point { x: 30.0, y: 2.0 },
                     TerminalGridPoint {
-                        line: Line(2),
-                        column: Column(20),
+                        row: Line(2),
+                        col: Column(20),
                     },
                 ),
                 (
                     Point { x: 10.0, y: 10.0 },
                     Point { x: 30.0, y: 2.0 },
                     TerminalGridPoint {
-                        line: Line(0),
-                        column: Column(20),
+                        row: Line(0),
+                        col: Column(20),
                     },
                 ),
             ];
@@ -1026,8 +1027,8 @@ mod tests {
                     MouseButton::LeftMove,
                     _modifiers,
                     TerminalGridPoint {
-                        line: Line(49),
-                        column: Column(79),
+                        row: Line(49),
+                        col: Column(79),
                     },
                     true,
                 )
@@ -1063,8 +1064,8 @@ mod tests {
                     MouseButton::LeftMove,
                     _modifiers,
                     TerminalGridPoint {
-                        line: Line(49),
-                        column: Column(79),
+                        row: Line(49),
+                        col: Column(79),
                     },
                     true,
                 )
@@ -1127,8 +1128,8 @@ mod tests {
                 Command::ProcessLink(
                     LinkAction::Hover,
                     TerminalGridPoint {
-                        line: Line(49),
-                        column: Column(79),
+                        row: Line(49),
+                        col: Column(79),
                     },
                 )
             ));
@@ -1137,7 +1138,7 @@ mod tests {
 
     mod handle_button_released_tests {
         use super::*;
-        use alacritty_terminal::index::{Column, Line};
+        use rio_vt::crosswords::pos::{Column, Line};
 
         #[test]
         fn mouse_mode_activated() {
@@ -1161,8 +1162,8 @@ mod tests {
                     MouseButton::LeftButton,
                     _modifiers,
                     TerminalGridPoint {
-                        line: Line(0),
-                        column: Column(0)
+                        row: Line(0),
+                        col: Column(0)
                     },
                     false
                 )
@@ -1192,8 +1193,8 @@ mod tests {
                     MouseButton::LeftButton,
                     _modifiers,
                     TerminalGridPoint {
-                        line: Line(0),
-                        column: Column(0)
+                        row: Line(0),
+                        col: Column(0)
                     },
                     false
                 )
@@ -1203,8 +1204,8 @@ mod tests {
                 Command::ProcessLink(
                     LinkAction::Open,
                     TerminalGridPoint {
-                        line: Line(0),
-                        column: Column(0)
+                        row: Line(0),
+                        col: Column(0)
                     }
                 ),
             ));
@@ -1215,8 +1216,8 @@ mod tests {
             let mut state = TerminalViewState::new(0);
             state.keyboard_modifiers = Modifiers::COMMAND;
             state.mouse_position_on_grid = TerminalGridPoint {
-                line: Line(4),
-                column: Column(10),
+                row: Line(4),
+                col: Column(10),
             };
             let terminal_mode = TermMode::empty(); // Assume SGR_MOUSE mode doesn't affect link opening
             let bindings = BindingsLayout::new();
@@ -1235,8 +1236,8 @@ mod tests {
                 Command::ProcessLink(
                     LinkAction::Open,
                     TerminalGridPoint {
-                        line: Line(4),
-                        column: Column(10)
+                        row: Line(4),
+                        col: Column(10)
                     }
                 ),
             ));
