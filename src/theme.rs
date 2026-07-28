@@ -1,6 +1,6 @@
 use crate::settings::ThemeSettings;
-use alacritty_terminal::vte::ansi::{self, NamedColor};
 use iced::{widget::container, Color};
+use rio_vt::config::colors::{AnsiColor, NamedColor};
 use std::collections::HashMap;
 
 pub(crate) trait TerminalStyle {
@@ -97,10 +97,10 @@ impl Theme {
         }
     }
 
-    pub fn get_color(&self, c: ansi::Color) -> Color {
+    pub fn get_color(&self, c: AnsiColor) -> Color {
         match c {
-            ansi::Color::Spec(rgb) => Color::from_rgb8(rgb.r, rgb.g, rgb.b),
-            ansi::Color::Indexed(index) => {
+            AnsiColor::Spec(rgb) => Color::from_rgb8(rgb.r, rgb.g, rgb.b),
+            AnsiColor::Indexed(index) => {
                 if index <= 15 {
                     let color = match index {
                         // Normal terminal colors
@@ -134,10 +134,12 @@ impl Theme {
                     None => Color::from_rgb8(0, 0, 0),
                 }
             },
-            ansi::Color::Named(c) => {
+            AnsiColor::Named(c) => {
                 let color = match c {
                     NamedColor::Foreground => &self.palette.foreground,
                     NamedColor::Background => &self.palette.background,
+                    // The cursor color falls back to the foreground.
+                    NamedColor::Cursor => &self.palette.foreground,
                     // Normal terminal colors
                     NamedColor::Black => &self.palette.black,
                     NamedColor::Red => &self.palette.red,
@@ -148,15 +150,15 @@ impl Theme {
                     NamedColor::Cyan => &self.palette.cyan,
                     NamedColor::White => &self.palette.white,
                     // Bright terminal colors
-                    NamedColor::BrightBlack => &self.palette.bright_black,
-                    NamedColor::BrightRed => &self.palette.bright_red,
-                    NamedColor::BrightGreen => &self.palette.bright_green,
-                    NamedColor::BrightYellow => &self.palette.bright_yellow,
-                    NamedColor::BrightBlue => &self.palette.bright_blue,
-                    NamedColor::BrightMagenta => &self.palette.bright_magenta,
-                    NamedColor::BrightCyan => &self.palette.bright_cyan,
-                    NamedColor::BrightWhite => &self.palette.bright_white,
-                    NamedColor::BrightForeground => {
+                    NamedColor::LightBlack => &self.palette.bright_black,
+                    NamedColor::LightRed => &self.palette.bright_red,
+                    NamedColor::LightGreen => &self.palette.bright_green,
+                    NamedColor::LightYellow => &self.palette.bright_yellow,
+                    NamedColor::LightBlue => &self.palette.bright_blue,
+                    NamedColor::LightMagenta => &self.palette.bright_magenta,
+                    NamedColor::LightCyan => &self.palette.bright_cyan,
+                    NamedColor::LightWhite => &self.palette.bright_white,
+                    NamedColor::LightForeground => {
                         match &self.palette.bright_foreground {
                             Some(color) => color,
                             None => &self.palette.foreground,
@@ -172,7 +174,6 @@ impl Theme {
                     NamedColor::DimMagenta => &self.palette.dim_magenta,
                     NamedColor::DimCyan => &self.palette.dim_cyan,
                     NamedColor::DimWhite => &self.palette.dim_white,
-                    _ => &self.palette.background,
                 };
 
                 hex_to_color(color)
@@ -242,7 +243,6 @@ impl TerminalStyle for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::vte::ansi;
     use std::collections::HashMap;
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
         ]);
 
         for index in 0..16 {
-            let color = default_theme.get_color(ansi::Color::Indexed(index));
+            let color = default_theme.get_color(AnsiColor::Indexed(index));
             let expected_color = basic_indexed_colors_map.get(&index).unwrap();
             assert_eq!(color, hex_to_color(expected_color).unwrap())
         }

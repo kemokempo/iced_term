@@ -13,7 +13,7 @@ license = "MIT"
 [package]
 name = "iced_term"
 version.workspace = true
-description = "Terminal emulator widget powered by ICED framework and alacritty terminal backend."
+description = "Terminal emulator widget powered by the ICED framework and the rio-vt terminal backend (enables image protocols)."
 authors = ["Ilya Shvyryalkin <ilyashvy@gmail.com>"]
 repository.workspace = true
 categories = ["gui"]
@@ -21,7 +21,9 @@ license.workspace = true
 edition.workspace = true
 
 [dependencies]
-alacritty_terminal = "0.25.1"
+rio-vt = "0.5.1"
+teletypewriter = "0.5.1"
+corcovado = "0.5.1"
 iced = { workspace = true, features = [
     "canvas",
     "lazy",

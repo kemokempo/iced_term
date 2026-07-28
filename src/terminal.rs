@@ -4,7 +4,7 @@ use crate::bindings::{Binding, BindingAction, BindingsLayout, InputKind};
 use crate::font::TermFont;
 use crate::settings::{FontSettings, Settings, ThemeSettings};
 use crate::theme::{ColorPalette, Theme};
-use crate::AlacrittyEvent;
+use crate::RioEvent;
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt, StreamExt};
 use iced::widget::canvas::Cache;
@@ -36,7 +36,7 @@ pub struct Terminal {
     pub(crate) cache: Cache,
     pub(crate) bindings: BindingsLayout,
     pub(crate) backend: backend::Backend,
-    backend_event_rx: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    backend_event_rx: Arc<Mutex<Receiver<RioEvent>>>,
 }
 
 impl Terminal {
@@ -116,7 +116,7 @@ impl Terminal {
 #[derive(Clone)]
 struct TerminalSubscriptionData {
     id: u64,
-    event_receiver: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    event_receiver: Arc<Mutex<Receiver<RioEvent>>>,
 }
 
 impl Hash for TerminalSubscriptionData {
@@ -136,12 +136,12 @@ fn terminal_subscription_stream(
             let mut event_receiver = event_receiver.lock().await;
             match event_receiver.recv().await {
                 Some(event) => {
-                    if let AlacrittyEvent::Exit = event {
+                    if let RioEvent::Exit = event {
                         shutdown = true
                     };
 
                     output
-                        .send(Event::BackendCall(id, backend::Command::ProcessAlacrittyEvent(event)))
+                        .send(Event::BackendCall(id, backend::Command::ProcessRioEvent(event)))
                         .await
                         .unwrap_or_else(|_| {
                             panic!("iced_term stream {}: sending BackendEventReceived event is failed", id)

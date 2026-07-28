@@ -1,8 +1,8 @@
-use alacritty_terminal::term::TermMode;
 use iced_core::{
     keyboard::{key::Named, Modifiers},
     mouse::Button,
 };
+use rio_vt::crosswords::Mode as TermMode;
 
 #[derive(Clone, Hash, Debug, PartialEq, Eq)]
 pub enum BindingAction {
@@ -21,13 +21,28 @@ pub enum InputKind {
     Mouse(Button),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Binding<T> {
     pub target: T,
     pub modifiers: Modifiers,
     pub terminal_mode_include: TermMode,
     pub terminal_mode_exclude: TermMode,
 }
+
+// rio-vt's `Mode` bitflags do not derive `PartialEq`/`Eq`, so compare the
+// raw flag bits instead of deriving on `Binding`.
+impl<T: PartialEq> PartialEq for Binding<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.target == other.target
+            && self.modifiers == other.modifiers
+            && self.terminal_mode_include.bits()
+                == other.terminal_mode_include.bits()
+            && self.terminal_mode_exclude.bits()
+                == other.terminal_mode_exclude.bits()
+    }
+}
+
+impl<T: Eq> Eq for Binding<T> {}
 
 pub type KeyboardBinding = Binding<InputKind>;
 pub type MouseBinding = Binding<InputKind>;
@@ -355,11 +370,11 @@ mod tests {
     use crate::bindings::MouseBinding;
 
     use super::{BindingAction, BindingsLayout, InputKind, KeyboardBinding};
-    use alacritty_terminal::term::TermMode;
     use iced_core::{
         keyboard::{key::Named, Modifiers},
         mouse::Button,
     };
+    use rio_vt::crosswords::Mode as TermMode;
 
     #[test]
     fn add_new_custom_keyboard_binding() {
