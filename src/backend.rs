@@ -11,7 +11,7 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
     self,
-    cell::{Cell, Flags},
+    cell::Cell,
     test::TermSize,
     viewport_to_point, Term, TermMode,
 };
@@ -481,51 +481,7 @@ impl Backend {
     }
 
     pub fn selectable_content(&self) -> String {
-        let content = self.renderable_content();
-        let Some(range) = content.selectable_range else {
-            return String::new();
-        };
-
-        // Group the selected cells BY LINE before rebuilding the text. `display_iter` walks the grid
-        // row-major (increasing columns, then next line); we accumulate the selected chars of the current
-        // line and remember whether its LAST column carries the WRAPLINE flag (soft-wrapped onto the next
-        // line). A line can be traversed without any selected cell (before/after the range): `selected`
-        // distinguishes it so we do not emit an empty line for it.
-        let mut lines: Vec<SelectedLine> = Vec::new();
-        let mut cur_line: Option<i32> = None;
-        let mut chars: Vec<char> = Vec::new();
-        let mut selected = false;
-        let mut wrapped = false;
-        for indexed in content.grid.display_iter() {
-            let line = indexed.point.line.0;
-            if cur_line != Some(line) {
-                // `chars` is drained by `mem::take` when the line was selected; otherwise it is already
-                // empty (we only push under `range.contains`, which also sets `selected`).
-                if selected {
-                    lines.push(SelectedLine {
-                        chars: std::mem::take(&mut chars),
-                        wrapped,
-                    });
-                }
-                cur_line = Some(line);
-                selected = false;
-                // `wrapped` is not reset here: every cell of the new line rewrites it below, so at the
-                // next flush it holds the value of the last column.
-            }
-            if range.contains(indexed.point) {
-                chars.push(indexed.c);
-                selected = true;
-            }
-            // The WRAPLINE flag lives on the LAST cell (last column) of the physical line. Since columns
-            // are walked in order, the last write before a line change is that column, so its value wins
-            // at flush time.
-            wrapped = indexed.cell.flags.contains(Flags::WRAPLINE);
-        }
-        if selected {
-            lines.push(SelectedLine { chars, wrapped });
-        }
-
-        join_selected_lines(&lines, range.is_block)
+        self.term.lock().selection_to_string().unwrap_or_default()
     }
 
     pub fn sync(&mut self) {
@@ -564,48 +520,6 @@ impl Backend {
             .find(|rm| rm.contains(&point));
         x
     }
-}
-
-// One line of the rebuilt selection: the selected chars in column order, and whether the physical line
-// is soft-wrapped (WRAPLINE) onto the next one.
-#[derive(Debug, Clone, PartialEq)]
-struct SelectedLine {
-    chars: Vec<char>,
-    wrapped: bool,
-}
-
-// Rebuild the text of a multi-line selection from the collected lines. Rules:
-//   - a newline is inserted on a LOGICAL line change, but NOT between a line and its physical wrap (a
-//     soft-wrapped logical line stays a single line when copied);
-//   - trailing-space padding is trimmed at the end of each logical line, but NOT on a wrapped segment
-//     (its trailing spaces can be significant: they precede the continuation of the line);
-//   - for a BLOCK (rectangular) selection, wrapping does not apply: each line is independent, so always
-//     a newline between them and always the trailing trim.
-// Pure function (no grid access): directly testable.
-fn join_selected_lines(lines: &[SelectedLine], is_block: bool) -> String {
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        let is_last = i + 1 == lines.len();
-        let wrapped = line.wrapped && !is_block;
-        if wrapped && !is_last {
-            // Wrapped segment: keep the text as is and append the continuation with no separator.
-            out.extend(line.chars.iter());
-        } else {
-            // End of a logical line: trim to the last non-space char (drops the padding), then a newline
-            // except for the very last line. `rposition` finds the last non-space; when absent (empty or
-            // blank line) it yields an empty slice, which preserves a legitimately empty line.
-            let end = line
-                .chars
-                .iter()
-                .rposition(|&c| c != ' ')
-                .map_or(0, |p| p + 1);
-            out.extend(line.chars[..end].iter());
-            if !is_last {
-                out.push('\n');
-            }
-        }
-    }
-    out
 }
 
 /// Copied from alacritty/src/display/hint.rs:
@@ -661,70 +575,5 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.try_send(event);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Build a line to copy (trailing spaces simulate the grid padding up to the right edge).
-    fn line(text: &str, wrapped: bool) -> SelectedLine {
-        SelectedLine {
-            chars: text.chars().collect(),
-            wrapped,
-        }
-    }
-
-    #[test]
-    fn join_multiline_inserts_newlines_and_trims_padding() {
-        // Three non-wrapped lines with trailing-space padding: we want a newline between each and no
-        // trailing spaces.
-        let lines = vec![
-            line("abc      ", false),
-            line("def   ", false),
-            line("ghi", false),
-        ];
-        assert_eq!(join_selected_lines(&lines, false), "abc\ndef\nghi");
-    }
-
-    #[test]
-    fn join_single_line_is_untouched_except_trailing_padding() {
-        // Common case: a single line. No newline added; trailing padding removed; significant inner
-        // spaces preserved.
-        let lines = vec![line("hello world   ", false)];
-        assert_eq!(join_selected_lines(&lines, false), "hello world");
-    }
-
-    #[test]
-    fn join_wrapped_line_is_not_split() {
-        // The first line is the physical wrap of the logical line: no newline, no trim, the continuation
-        // is appended directly.
-        let lines = vec![line("abcde", true), line("fg", false)];
-        assert_eq!(join_selected_lines(&lines, false), "abcdefg");
-    }
-
-    #[test]
-    fn join_wrapped_line_keeps_significant_trailing_space() {
-        // A wrapped segment ending with a real space: the space belongs to the logical line and must not
-        // be trimmed (otherwise "foo " + "bar" would become "foobar" instead of "foo bar").
-        let lines = vec![line("foo ", true), line("bar", false)];
-        assert_eq!(join_selected_lines(&lines, false), "foo bar");
-    }
-
-    #[test]
-    fn join_block_selection_ignores_wrap() {
-        // In block mode the wrapped flag is ignored: each line is independent (newline + trim), even if
-        // the cells carry WRAPLINE.
-        let lines = vec![line("ab  ", true), line("cd  ", true)];
-        assert_eq!(join_selected_lines(&lines, true), "ab\ncd");
-    }
-
-    #[test]
-    fn join_preserves_blank_middle_line() {
-        // A blank line in the middle of the selection stays a blank line (double newline).
-        let lines =
-            vec![line("foo", false), line("   ", false), line("bar", false)];
-        assert_eq!(join_selected_lines(&lines, false), "foo\n\nbar");
     }
 }
