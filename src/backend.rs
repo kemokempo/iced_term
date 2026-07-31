@@ -10,10 +10,7 @@ use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{
-    self,
-    cell::Cell,
-    test::TermSize,
-    viewport_to_point, Term, TermMode,
+    self, cell::Cell, test::TermSize, viewport_to_point, Term, TermMode,
 };
 use alacritty_terminal::{tty, Grid};
 use iced::keyboard::Modifiers;
