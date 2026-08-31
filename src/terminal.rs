@@ -5,8 +5,6 @@ use crate::font::TermFont;
 use crate::settings::{FontSettings, Settings, ThemeSettings};
 use crate::theme::{ColorPalette, Theme};
 use crate::AlacrittyEvent;
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::Line;
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt, StreamExt};
 use iced::widget::canvas::Cache;
@@ -77,7 +75,7 @@ impl Terminal {
     }
 
     /// The terminal's text, scrollback first and the visible screen last, one
-    /// `String` per row with trailing blanks trimmed.
+    /// `String` per line.
     ///
     /// For callers that need to read what the terminal shows rather than only
     /// draw it: scraping the output of a command an application wrote into the
@@ -85,24 +83,11 @@ impl Terminal {
     /// screen to an accessibility layer. [`Self::handle`] can write into the
     /// PTY already; this is the other half of that conversation.
     ///
-    /// Rows are taken from the grid as it was at the last sync, so this reflects
-    /// what the widget last drew.
+    /// A line is a *logical* line, not a grid row: output that wrapped across
+    /// the terminal's width comes back joined, so a reader is not looking at
+    /// where the window happened to be split. Trailing blanks are trimmed.
     pub fn text(&self) -> Vec<String> {
-        let grid = &self.backend.renderable_content().grid;
-        let mut rows = Vec::with_capacity(grid.total_lines());
-        for line in 0..grid.total_lines() {
-            // `Grid` indexes the scrollback with negative lines and the visible
-            // screen from zero, so counting down from the oldest history row
-            // yields the buffer in reading order.
-            let line = Line(line as i32 - grid.history_size() as i32);
-            let mut row: String =
-                grid[line].into_iter().map(|cell| cell.c).collect();
-            while row.ends_with(' ') {
-                row.pop();
-            }
-            rows.push(row);
-        }
-        rows
+        self.backend.text()
     }
 
     pub fn handle(&mut self, cmd: Command) -> Action {

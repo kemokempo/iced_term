@@ -481,6 +481,28 @@ impl Backend {
         self.term.lock().selection_to_string().unwrap_or_default()
     }
 
+    /// The whole buffer as text, scrollback first and the visible screen last.
+    ///
+    /// [`Term::bounds_to_string`] does the work: it already trims each line at
+    /// its last written cell, skips wide-character spacers, collapses tab runs
+    /// and joins a row flagged `WRAPLINE` to the next, so what comes back is
+    /// logical lines rather than however the window happened to split them.
+    ///
+    /// Unlike [`Self::renderable_content`] this reads the terminal itself, not
+    /// the last synced snapshot of it.
+    pub fn text(&self) -> Vec<String> {
+        let term = self.term.lock();
+        // The grid indexes scrollback with negative lines and the visible
+        // screen from zero, so the oldest history row is the negated history
+        // size and the newest is the bottommost line.
+        let start = Point::new(Line(-(term.history_size() as i32)), Column(0));
+        let end = Point::new(term.bottommost_line(), term.last_column());
+        term.bounds_to_string(start, end)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     pub fn sync(&mut self) {
         let term = self.term.clone();
         let mut term = term.lock();
