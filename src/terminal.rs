@@ -74,6 +74,22 @@ impl Terminal {
         Subscription::run_with(data, terminal_subscription_stream)
     }
 
+    /// The terminal's text, scrollback first and the visible screen last, one
+    /// `String` per line.
+    ///
+    /// For callers that need to read what the terminal shows rather than only
+    /// draw it: scraping the output of a command an application wrote into the
+    /// PTY itself, asserting on a terminal's contents in a test, or handing the
+    /// screen to an accessibility layer. [`Self::handle`] can write into the
+    /// PTY already; this is the other half of that conversation.
+    ///
+    /// A line is a *logical* line, not a grid row: output that wrapped across
+    /// the terminal's width comes back joined, so a reader is not looking at
+    /// where the window happened to be split. Trailing blanks are trimmed.
+    pub fn text(&self) -> Vec<String> {
+        self.backend.text()
+    }
+
     pub fn handle(&mut self, cmd: Command) -> Action {
         let mut action = Action::default();
 
