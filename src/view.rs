@@ -15,6 +15,7 @@ use iced::widget::canvas::{Path, Text};
 use iced::widget::container;
 use iced::{Color, Element, Length, Point, Rectangle, Size, Theme};
 use iced_core::clipboard::Kind as ClipboardKind;
+use iced_core::input_method::{self, InputMethod, Purpose};
 use iced_core::keyboard::{Key, Modifiers};
 use iced_core::mouse::{self, Click};
 use iced_core::text::{Alignment, LineHeight, Shaping};
@@ -340,12 +341,14 @@ impl<'a> TerminalView<'a> {
                     let lower = k.to_ascii_lowercase();
                     binding_action = self.term.bindings.get_action(
                         InputKind::Char(lower),
-                        state.keyboard_modifiers,
+                        *modifiers,
                         last_content.terminal_mode,
                     );
 
                     // If no binding matched, only write printable text (when provided)
-                    if binding_action == BindingAction::Ignore {
+                    if binding_action == BindingAction::Ignore
+                        && !state.ime_active
+                    {
                         if let Some(c) = text {
                             return Some(Command::Write(c.as_bytes().to_vec()));
                         }
@@ -393,6 +396,71 @@ impl<'a> TerminalView<'a> {
         };
 
         None
+    }
+
+    fn handle_input_method_event(
+        &self,
+        state: &mut TerminalViewState,
+        event: &input_method::Event,
+    ) -> Option<Command> {
+        match event {
+            input_method::Event::Opened => {
+                state.ime_active = true;
+                state.ime_preedit = None;
+                None
+            },
+            input_method::Event::Preedit(content, selection) => {
+                state.ime_active = true;
+                state.ime_preedit = if content.is_empty() {
+                    None
+                } else {
+                    Some(input_method::Preedit {
+                        content: content.clone(),
+                        selection: selection.clone(),
+                        text_size: Some(iced_core::Pixels(self.term.font.size)),
+                    })
+                };
+                None
+            },
+            input_method::Event::Commit(text) => {
+                state.ime_active = true;
+                state.ime_preedit = None;
+                Some(Command::Write(text.as_bytes().to_vec()))
+            },
+            input_method::Event::Closed => {
+                state.ime_active = false;
+                state.ime_preedit = None;
+                None
+            },
+        }
+    }
+
+    fn input_method<'b>(
+        &self,
+        state: &'b TerminalViewState,
+        layout: iced::advanced::Layout<'_>,
+    ) -> InputMethod<&'b str> {
+        if !state.is_focused() {
+            return InputMethod::Disabled;
+        }
+
+        let content = self.term.backend.renderable_content();
+        let terminal_size = content.terminal_size;
+        let cursor_point = content.grid.cursor.point;
+        let display_offset = content.grid.display_offset() as f32;
+        let cell_width = terminal_size.cell_width as f32;
+        let cell_height = terminal_size.cell_height as f32;
+        let x = layout.position().x + (cursor_point.column.0 as f32 * cell_width);
+        let y = layout.position().y + ((cursor_point.line.0 as f32 + display_offset) * cell_height);
+
+        InputMethod::Enabled {
+            cursor: Rectangle::new(
+                Point::new(x, y),
+                Size::new(cell_width.max(1.0), cell_height.max(1.0)),
+            ),
+            purpose: Purpose::Terminal,
+            preedit: state.ime_preedit.as_ref().map(input_method::Preedit::as_ref),
+        }
     }
 }
 
@@ -487,7 +555,15 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 let y = layout_offset_y
                     + (((line as f32) + display_offset) * cell_height);
                 let cell_center_y = y + half_h;
-                let cell_center_x = x + half_w;
+                let cell_center_x = if indexed
+                    .cell
+                    .flags
+                    .contains(cell::Flags::WIDE_CHAR)
+                {
+                    x + cell_width
+                } else {
+                    x + half_w
+                };
 
                 // Resolve colors for this cell
                 let mut fg = self.term.theme.get_color(indexed.fg);
@@ -666,6 +742,10 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
         let is_cursor_in_layout = self.is_cursor_in_layout(cursor, layout);
         self.handle_focus(event, state, is_cursor_in_layout);
 
+        if matches!(event, iced::Event::Window(iced::window::Event::RedrawRequested(_))) {
+            shell.request_input_method(&self.input_method(state, layout));
+        }
+
         let commands = match event {
             iced::Event::Mouse(mouse_event) if is_cursor_in_layout => self
                 .handle_mouse_event(
@@ -680,6 +760,15 @@ impl Widget<Event, Theme, iced::Renderer> for TerminalView<'_> {
                 }
 
                 self.handle_keyboard_event(state, clipboard, keyboard_event)
+                    .into_iter()
+                    .collect()
+            },
+            iced::Event::InputMethod(input_method_event) => {
+                if !state.is_focused() {
+                    return;
+                }
+
+                self.handle_input_method_event(state, input_method_event)
                     .into_iter()
                     .collect()
             },
@@ -737,6 +826,8 @@ struct TerminalViewState {
     size: Size<f32>,
     mouse_position_on_grid: TerminalGridPoint,
     terminal_id: u64,
+    ime_active: bool,
+    ime_preedit: Option<input_method::Preedit>,
 }
 
 impl TerminalViewState {
@@ -750,6 +841,8 @@ impl TerminalViewState {
             size: Size::from([0.0, 0.0]),
             mouse_position_on_grid: TerminalGridPoint::default(),
             terminal_id,
+            ime_active: false,
+            ime_preedit: None,
         }
     }
 }
@@ -1293,6 +1386,99 @@ mod tests {
                     }
                 ),
             ));
+        }
+    }
+
+    mod handle_input_method_event_tests {
+        use super::*;
+
+        #[test]
+        fn opens_and_closes_ime_state() {
+            let terminal = Terminal::new(0, crate::settings::Settings::default())
+                .expect("terminal created");
+            let view = TerminalView { term: &terminal };
+            let mut state = TerminalViewState::new(0);
+
+            assert!(!state.ime_active);
+            assert!(state.ime_preedit.is_none());
+
+            let opened = view.handle_input_method_event(
+                &mut state,
+                &input_method::Event::Opened,
+            );
+            assert!(opened.is_none());
+            assert!(state.ime_active);
+
+            let closed = view.handle_input_method_event(
+                &mut state,
+                &input_method::Event::Closed,
+            );
+            assert!(closed.is_none());
+            assert!(!state.ime_active);
+            assert!(state.ime_preedit.is_none());
+        }
+
+        #[test]
+        fn stores_preedit_without_writing() {
+            let terminal = Terminal::new(0, crate::settings::Settings::default())
+                .expect("terminal created");
+            let view = TerminalView { term: &terminal };
+            let mut state = TerminalViewState::new(0);
+
+            let result = view.handle_input_method_event(
+                &mut state,
+                &input_method::Event::Preedit("ni".into(), Some(0..2)),
+            );
+
+            assert!(result.is_none());
+            assert!(state.ime_active);
+            let preedit = state.ime_preedit.expect("preedit stored");
+            assert_eq!(preedit.content, "ni");
+            assert_eq!(preedit.selection, Some(0..2));
+            assert_eq!(preedit.text_size, Some(iced_core::Pixels(terminal.font.size)));
+        }
+
+        #[test]
+        fn clears_preedit_on_empty_preedit() {
+            let terminal = Terminal::new(0, crate::settings::Settings::default())
+                .expect("terminal created");
+            let view = TerminalView { term: &terminal };
+            let mut state = TerminalViewState::new(0);
+            state.ime_preedit = Some(input_method::Preedit {
+                content: "ni".into(),
+                selection: Some(0..2),
+                text_size: Some(iced_core::Pixels(terminal.font.size)),
+            });
+
+            let result = view.handle_input_method_event(
+                &mut state,
+                &input_method::Event::Preedit(String::new(), None),
+            );
+
+            assert!(result.is_none());
+            assert!(state.ime_preedit.is_none());
+        }
+
+        #[test]
+        fn commits_utf8_text_once() {
+            let terminal = Terminal::new(0, crate::settings::Settings::default())
+                .expect("terminal created");
+            let view = TerminalView { term: &terminal };
+            let mut state = TerminalViewState::new(0);
+            state.ime_preedit = Some(input_method::Preedit {
+                content: "ni".into(),
+                selection: Some(0..2),
+                text_size: Some(iced_core::Pixels(terminal.font.size)),
+            });
+
+            let result = view.handle_input_method_event(
+                &mut state,
+                &input_method::Event::Commit("你".into()),
+            );
+
+            assert!(matches!(result, Some(Command::Write(bytes)) if bytes == "你".as_bytes().to_vec()));
+            assert!(state.ime_active);
+            assert!(state.ime_preedit.is_none());
         }
     }
 
