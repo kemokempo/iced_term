@@ -142,7 +142,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(
         id: u64,
-        pty_event_proxy_sender: mpsc::Sender<Event>,
+        pty_event_proxy_sender: mpsc::UnboundedSender<Event>,
         settings: BackendSettings,
     ) -> Result<Self> {
         let pty_config = tty::Options {
@@ -588,11 +588,52 @@ impl Drop for Backend {
     }
 }
 
+// The channel is unbounded on purpose: `send_event` is called from the GUI thread (e.g.
+// `Term::scroll_display` emits `MouseCursorDirty` during `Backend::handle`), and the only consumer
+// forwards events back to that same thread. A blocking send on a full bounded channel deadlocks
+// the GUI, and `try_send` silently drops events such as `PtyWrite` or `Exit`.
 #[derive(Clone)]
-pub struct EventProxy(mpsc::Sender<Event>);
+pub struct EventProxy(mpsc::UnboundedSender<Event>);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        let _ = self.0.try_send(event);
+        // The only possible error is a closed receiver (terminal dropped): nothing to deliver.
+        let _ = self.0.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `scroll_display` emits one event per call. With no consumer, every call must return and no
+    // event may be lost. The work runs on a separate thread with a timeout so that a blocking
+    // send fails the test instead of hanging it.
+    #[test]
+    fn send_event_never_blocks_nor_drops_without_consumer() {
+        const CALLS: usize = 1_000;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut term = Term::new(
+                term::Config::default(),
+                &TermSize::new(80, 24),
+                EventProxy(tx),
+            );
+            for _ in 0..CALLS {
+                term.scroll_display(Scroll::Bottom);
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("send_event blocked without a consumer");
+
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, CALLS, "events were dropped");
     }
 }
