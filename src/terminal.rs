@@ -12,7 +12,7 @@ use iced::Subscription;
 use std::hash::{Hash, Hasher};
 use std::io::Result;
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, Receiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -36,12 +36,12 @@ pub struct Terminal {
     pub(crate) cache: Cache,
     pub(crate) bindings: BindingsLayout,
     pub(crate) backend: backend::Backend,
-    backend_event_rx: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    backend_event_rx: Arc<Mutex<UnboundedReceiver<AlacrittyEvent>>>,
 }
 
 impl Terminal {
     pub fn new(id: u64, settings: Settings) -> Result<Self> {
-        let (backend_event_tx, backend_event_rx) = mpsc::channel(100);
+        let (backend_event_tx, backend_event_rx) = mpsc::unbounded_channel();
         let theme = Theme::new(settings.theme);
         let font = TermFont::new(settings.font);
 
@@ -132,7 +132,7 @@ impl Terminal {
 #[derive(Clone)]
 struct TerminalSubscriptionData {
     id: u64,
-    event_receiver: Arc<Mutex<Receiver<AlacrittyEvent>>>,
+    event_receiver: Arc<Mutex<UnboundedReceiver<AlacrittyEvent>>>,
 }
 
 impl Hash for TerminalSubscriptionData {

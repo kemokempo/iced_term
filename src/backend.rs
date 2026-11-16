@@ -142,7 +142,7 @@ pub struct Backend {
 impl Backend {
     pub fn new(
         id: u64,
-        pty_event_proxy_sender: mpsc::Sender<Event>,
+        pty_event_proxy_sender: mpsc::UnboundedSender<Event>,
         settings: BackendSettings,
     ) -> Result<Self> {
         let pty_config = tty::Options {
@@ -588,11 +588,141 @@ impl Drop for Backend {
     }
 }
 
+// The channel is unbounded on purpose: `send_event` is called from the GUI thread (e.g.
+// `Term::scroll_display` emits `MouseCursorDirty` during `Backend::handle`), and the only consumer
+// forwards events back to that same thread. A blocking send on a full bounded channel deadlocks
+// the GUI, and `try_send` silently drops events such as `PtyWrite` or `Exit`.
 #[derive(Clone)]
-pub struct EventProxy(mpsc::Sender<Event>);
+pub struct EventProxy(mpsc::UnboundedSender<Event>);
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
-        let _ = self.0.try_send(event);
+        // The only possible error is a closed receiver (terminal dropped): nothing to deliver.
+        let _ = self.0.send(event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `scroll_display` emits one event per call. With no consumer, every call must return and no
+    // event may be lost. The work runs on a separate thread with a timeout so that a blocking
+    // send fails the test instead of hanging it.
+    #[test]
+    fn send_event_never_blocks_nor_drops_without_consumer() {
+        const CALLS: usize = 1_000;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut term = Term::new(
+                term::Config::default(),
+                &TermSize::new(80, 24),
+                EventProxy(tx),
+            );
+            for _ in 0..CALLS {
+                term.scroll_display(Scroll::Bottom);
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("send_event blocked without a consumer");
+
+        let mut received = 0;
+        while rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, CALLS, "events were dropped");
+    }
+}
+
+// Real-PTY counterpart to the synthetic test above. A bounded channel loses events from an actual
+// terminal session, not just from a loop with no consumer. `Bell` is the instrument: alacritty
+// emits exactly one per BEL byte (`term/mod.rs::bell`), so a program printing N bells gives a known
+// expected count and the loss can be measured. The same channel carries `PtyWrite` and `Exit`,
+// where a loss cannot be counted, it just breaks the session.
+//
+// Unix only: the flood is produced by a POSIX shell (`printf`, `seq`), which the Windows runner
+// does not have.
+#[cfg(all(test, unix))]
+mod real_pty_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    const BELLS: usize = 5_000;
+
+    // A real shell that prints BELLS bell bytes and then exits. Real PTY output, no hand-injected
+    // events.
+    fn flood_settings(bells: usize) -> BackendSettings {
+        BackendSettings {
+            program: "/bin/bash".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("printf '\\a%.0s' $(seq 1 {bells})"),
+            ],
+            env: HashMap::new(),
+            working_directory: None,
+        }
+    }
+
+    struct Drained {
+        bells: usize,
+        exit: bool,
+    }
+
+    // Aggressive consumer: tight loop, no per-event work, 1 ms sleep only when the queue is empty.
+    // A real client does one batch per rendered frame, so whatever is lost here is lost a fortiori
+    // in an application.
+    fn drain(
+        rx: &mut mpsc::UnboundedReceiver<Event>,
+        budget: Duration,
+    ) -> Drained {
+        let deadline = Instant::now() + budget;
+        let mut out = Drained {
+            bells: 0,
+            exit: false,
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(Event::Bell) => out.bells += 1,
+                Ok(Event::Exit) => {
+                    out.exit = true;
+                    return out;
+                },
+                Ok(_) => {},
+                Err(TryRecvError::Empty) => {
+                    if Instant::now() >= deadline {
+                        return out;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                },
+                Err(TryRecvError::Disconnected) => return out,
+            }
+        }
+    }
+
+    #[test]
+    fn real_pty_flood_keeps_every_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _backend =
+            Backend::new(1, tx, flood_settings(BELLS)).expect("pty must start");
+
+        let got = drain(&mut rx, Duration::from_secs(10));
+
+        assert_eq!(
+            got.bells,
+            BELLS,
+            "lost {} of {BELLS} Bell events from a real PTY",
+            BELLS - got.bells
+        );
+        assert!(
+            got.exit,
+            "Exit was lost: the stream would later panic with \
+             \"terminal event channel closed unexpected\""
+        );
     }
 }
