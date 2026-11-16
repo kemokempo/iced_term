@@ -643,7 +643,10 @@ mod tests {
 // emits exactly one per BEL byte (`term/mod.rs::bell`), so a program printing N bells gives a known
 // expected count and the loss can be measured. The same channel carries `PtyWrite` and `Exit`,
 // where a loss cannot be counted, it just breaks the session.
-#[cfg(test)]
+//
+// Unix only: the flood is produced by a POSIX shell (`printf`, `seq`), which the Windows runner
+// does not have.
+#[cfg(all(test, unix))]
 mod real_pty_tests {
     use super::*;
     use std::collections::HashMap;
@@ -674,9 +677,15 @@ mod real_pty_tests {
     // Aggressive consumer: tight loop, no per-event work, 1 ms sleep only when the queue is empty.
     // A real client does one batch per rendered frame, so whatever is lost here is lost a fortiori
     // in an application.
-    fn drain(rx: &mut mpsc::UnboundedReceiver<Event>, budget: Duration) -> Drained {
+    fn drain(
+        rx: &mut mpsc::UnboundedReceiver<Event>,
+        budget: Duration,
+    ) -> Drained {
         let deadline = Instant::now() + budget;
-        let mut out = Drained { bells: 0, exit: false };
+        let mut out = Drained {
+            bells: 0,
+            exit: false,
+        };
         loop {
             match rx.try_recv() {
                 Ok(Event::Bell) => out.bells += 1,
@@ -705,7 +714,8 @@ mod real_pty_tests {
         let got = drain(&mut rx, Duration::from_secs(10));
 
         assert_eq!(
-            got.bells, BELLS,
+            got.bells,
+            BELLS,
             "lost {} of {BELLS} Bell events from a real PTY",
             BELLS - got.bells
         );
