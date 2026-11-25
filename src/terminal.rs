@@ -167,9 +167,58 @@ fn terminal_subscription_stream(
                     if !shutdown {
                         panic!("iced_term stream {}: terminal event channel closed unexpected", id);
                     }
+                    // Channel closed after an `Exit`: every sender is gone, so
+                    // `recv` returns `None` at once and never registers a
+                    // wakeup. Returning ENDS the stream, since the closure
+                    // drops `output` and that closes the sink. Looping instead
+                    // spins on an await point that never pends and holds the
+                    // async executor that drives EVERY terminal's
+                    // subscription: the others stop being polled and the UI
+                    // only redraws on input.
+                    return;
                 },
             }
         }
     })
     .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A terminal that ends on its own sends `Exit` THROUGH this stream, then
+    // its senders drop and `recv` returns `None` without ever pending. The
+    // stream has to END: looping instead holds the async executor that drives
+    // every terminal's subscription. The work runs on its own thread, so a
+    // loop that spins fails this test on the timeout instead of hanging the
+    // whole test binary.
+    #[test]
+    fn stream_ends_when_channel_closes_after_exit() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(AlacrittyEvent::Exit).expect("send Exit");
+            drop(tx); // Last sender gone: `recv` gives `None` once drained.
+
+            let data = TerminalSubscriptionData {
+                id: 1,
+                event_receiver: Arc::new(Mutex::new(rx)),
+            };
+            let mut stream = terminal_subscription_stream(&data);
+            let delivered = iced::futures::executor::block_on(async {
+                let mut count = 0;
+                while stream.next().await.is_some() {
+                    count += 1;
+                }
+                count
+            });
+            let _ = done_tx.send(delivered);
+        });
+
+        let delivered = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stream never ended: the loop spins on `None`");
+        assert_eq!(delivered, 1, "only `Exit` should arrive before the end");
+    }
 }
